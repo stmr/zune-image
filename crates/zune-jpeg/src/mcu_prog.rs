@@ -33,6 +33,9 @@ use crate::worker::upsample_dimensions_valid;
 const PROGRESSIVE_CHECKPOINT_ROW_INTERVAL: usize = 8;
 const SMOOTHING_COEFFICIENTS: [usize; 10] = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24];
 
+#[cfg(feature = "std")]
+mod scans;
+
 fn progressive_input_available<B: BitStream>(stream: &B) -> bool {
     // Refill records EOF after reading the last real byte, then appends zero
     // bytes for lookahead. Those buffered real bits still belong to this scan.
@@ -320,6 +323,20 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         stream.set_strict(self.options.strict_mode());
 
         let preserve_progressive_scans = self.mcu_checkpoints_enabled;
+
+        #[cfg(feature = "std")]
+        if self.options.jpeg_get_threads() > 1
+            && !preserve_progressive_scans
+            && !self.is_arithmetic
+            && !self.expects_dnl
+            && self.cancel.is_none()
+            && self.progressive_completed_scans == 0
+            && self.progressive_scan_checkpoint().is_none()
+            && self.decode_progressive_scans_parallel::<B>(block, output.is_raw())
+        {
+            self.reassemble_extended_xmp();
+            return self.finish_progressive_decoding(block, output, upsampler_scratch);
+        }
 
         if !self.decode_progressive_scan(
             &mut stream,

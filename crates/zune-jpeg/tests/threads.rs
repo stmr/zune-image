@@ -39,6 +39,52 @@ fn progressive_threads_match_single_thread() {
     }
 }
 
+fn try_decode(data: &[u8], threads: u8) -> Result<Vec<u8>, String> {
+    let options = DecoderOptions::default().jpeg_set_threads(threads);
+    JpegDecoder::new_with_options(ZCursor::new(data), options)
+        .decode()
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Damaged progressive files take the sequential fallback of the concurrent scan decoder (or
+/// not, when the damage is in a part it tolerates) and must end exactly as one thread does.
+#[test]
+fn damaged_progressive_threads_match_single_thread() {
+    let base = "../../test-images/jpeg/benchmarks/";
+    for name in [
+        "speed_bench_prog.jpg",
+        "speed_bench_prog_hv_sampling.jpg",
+        "../2029.jpg"
+    ] {
+        let data = std::fs::read(format!("{base}{name}")).unwrap();
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..24 {
+            let mut damaged = data.clone();
+            if round % 2 == 0 {
+                damaged.truncate(next() as usize % data.len());
+            } else {
+                for _ in 0..3 {
+                    let at = next() as usize % data.len();
+                    damaged[at] = next() as u8;
+                }
+            }
+            let reference = try_decode(&damaged, 1);
+            for threads in [2, 4] {
+                assert!(
+                    reference == try_decode(&damaged, threads),
+                    "{name} round {round} differs with {threads} threads"
+                );
+            }
+        }
+    }
+}
+
 /// Found by fuzzing (minimized): a progressive image the single-threaded finish rejects at its
 /// first MCU row ("Invalid component dimensions") must be rejected the same way with threads,
 /// not panic in a band that starts mid-image.
