@@ -3655,6 +3655,8 @@ where
     fn decode_mcu_output_with_success_cleanup(
         &mut self, output: &mut McuDecodeOutput<'_, '_>
     ) -> Result<(), DecodeErrors> {
+        // the pipelined baseline decoder takes the pixel buffer out of `output`
+        let pixels_len = output.pixels_mut().map(|pixels| pixels.len());
         match self.decode_mcu_output(output) {
             Ok(()) => {
                 // Drop the scan checkpoint so a post-success replay starts
@@ -3668,8 +3670,8 @@ where
                     state.scan_checkpoint = None;
                     state.progressive_checkpoint = None;
                 }
-                if let Some(pixels) = output.pixels_mut() {
-                    self.pixels_decoded = pixels.len();
+                if let Some(len) = pixels_len {
+                    self.pixels_decoded = len;
                 }
                 if self.is_progressive {
                     self.progressive_displayed_scans = self.progressive_completed_scans;

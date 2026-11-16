@@ -1,5 +1,6 @@
 ## Unreleased
 - Multi-threaded progressive finish (dequantize, IDCT, upsample, colour convert) following `DecoderOptions::num_threads` (default 4, `std` only); each thread gets at least 512K output pixels, so images under 1 MP stay single threaded. Output is bit-identical for every thread count; `set_num_threads(1)` keeps the previous single-threaded behaviour.
+- Pipelined baseline decoding with the same option and size threshold: the calling thread does entropy decoding and the IDCT, `threads - 1` workers up-sample and colour convert (single-scan, one-shot pixel output to a colour space other than luma; other cases decode single threaded).
 ## Version 0.5.7
 - Move scalar idct to wrapping maths.
 - Simd upsampling (mhils)
