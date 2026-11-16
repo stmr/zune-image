@@ -85,6 +85,18 @@ fn damaged_progressive_threads_match_single_thread() {
     }
 }
 
+/// The concurrent scan decoder rereads the rest of the input; a seekable `Read` input must
+/// give the same pixels as an in-memory one.
+#[test]
+fn progressive_threads_reader_input() {
+    let data = std::fs::read("../../test-images/jpeg/benchmarks/speed_bench_prog.jpg").unwrap();
+    let options = DecoderOptions::default().jpeg_set_threads(4);
+    let from_reader = JpegDecoder::new_with_options(std::io::Cursor::new(&data), options)
+        .decode()
+        .unwrap();
+    assert!(from_reader == decode(&data, ColorSpace::RGB, 1));
+}
+
 /// Found by fuzzing (minimized): a progressive image the single-threaded finish rejects at its
 /// first MCU row ("Invalid component dimensions") must be rejected the same way with threads,
 /// not panic in a band that starts mid-image.
