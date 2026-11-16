@@ -1868,6 +1868,207 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         *pixels_written = px;
         Ok(())
     }
+
+    pub(crate) fn post_ctx(&self) -> PostCtx {
+        PostCtx {
+            out_colorspace:   self.options.jpeg_get_out_colorspace(),
+            input_colorspace: self.input_colorspace,
+            color_convert_16: self.color_convert_16,
+            is_interleaved:   self.is_interleaved,
+            coeff:            self.coeff,
+            v_max:            self.v_max,
+            sample_ratio:     self.info.sample_ratio
+        }
+    }
+}
+
+/// The decoder state post-processing reads besides the components, so that bands of MCU
+/// rows can be post-processed on other threads with their own copy of the components.
+#[derive(Clone, Copy)]
+pub(crate) struct PostCtx {
+    pub out_colorspace:   ColorSpace,
+    pub input_colorspace: ColorSpace,
+    pub color_convert_16: crate::decoder::ColorConvert16Ptr,
+    pub is_interleaved:   bool,
+    pub coeff:            usize,
+    pub v_max:            usize,
+    pub sample_ratio:     SampleRatios
+}
+
+/// [`JpegDecoder::post_process`] for a band of MCU rows on a worker thread, reading the
+/// decoder state from `ctx`. Keep the two in sync: the sequential path keeps its own copy
+/// because routing it through this function measured ~1-2% slower on x86_64 Windows.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn post_process_rows(
+    ctx: &PostCtx, comps: &mut [crate::components::Components], pixels: &mut [u8],
+    output_stride: usize, i: usize, mcu_height: usize, width: usize, padded_width: usize,
+    pixels_written: &mut usize, upsampler_scratch_space: &mut [i16]
+) -> Result<(), DecodeErrors> {
+    let out_colorspace_components = ctx.out_colorspace.num_components();
+    let row_bytes = width
+        .checked_mul(out_colorspace_components)
+        .ok_or(DecodeErrors::FormatStatic("output row size overflow"))?;
+    if output_stride < row_bytes {
+        return Err(DecodeErrors::FormatStatic(
+            "output stride is smaller than the converted row width"
+        ));
+    }
+
+    let mut px = *pixels_written;
+    // indicates whether image is vertically up-sampled
+    let is_vertically_sampled = comps
+        .iter()
+        .any(|c| c.sample_ratio == SampleRatios::HV || c.sample_ratio == SampleRatios::V);
+
+    let mut comp_len = comps.len();
+
+    // If we are moving from YCbCr -> Luma, we do not allocate storage for other components, so we
+    // will panic when we are trying to read samples, so for that case,
+    // hardcode it so that we  don't panic when doing
+    //   *samp = &samples[j][pos * padded_width..(pos + 1) * padded_width]
+    if out_colorspace_components < comp_len && ctx.out_colorspace == Luma {
+        comp_len = out_colorspace_components;
+    }
+    let mut color_conv_function =
+        |num_iters: usize, samples: [&[i16]; 4]| -> Result<(), DecodeErrors> {
+            for (pos, output) in pixels[px..]
+                .chunks_exact_mut(output_stride)
+                .take(num_iters)
+                .enumerate()
+            {
+                let mut raw_samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+
+                // iterate over each line, since color-convert needs only
+                // one line
+                for (j, samp) in raw_samples.iter_mut().enumerate().take(comp_len) {
+                    let temp = &samples[j].get(pos * padded_width..(pos + 1) * padded_width);
+                    if temp.is_none() {
+                        return Err(DecodeErrors::FormatStatic("Missing samples"));
+                    }
+                    *samp = temp.unwrap();
+                }
+                color_convert(
+                    &raw_samples,
+                    ctx.color_convert_16,
+                    ctx.input_colorspace,
+                    ctx.out_colorspace,
+                    &mut output[..row_bytes],
+                    width,
+                    padded_width
+                )?;
+                px += output_stride;
+            }
+            Ok(())
+        };
+
+    if ctx.is_interleaved && ctx.out_colorspace != ColorSpace::Luma {
+        for comp in comps.iter_mut() {
+            upsample(
+                comp,
+                mcu_height,
+                i,
+                upsampler_scratch_space,
+                is_vertically_sampled
+            )?;
+        }
+
+        if is_vertically_sampled {
+            if i > 0 {
+                // write the last line, it wasn't  up-sampled as we didn't have row_down
+                // yet
+                let mut samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+
+                for (samp, component) in samples.iter_mut().zip(comps.iter()) {
+                    *samp = &component.first_row_upsample_dest;
+                }
+
+                // ensure length matches for all samples
+                let _first_len = samples[0].len();
+
+                // This was a good check, but can be caused to panic, esp on invalid/corrupt images.
+                // See one in issue https://github.com/etemesi254/zune-image/issues/262, so for now
+                // we just ignore and generate invalid images at the end.
+
+                //
+                //
+                // for samp in samples.iter().take(comp_len) {
+                //     assert_eq!(first_len, samp.len());
+                // }
+                let num_iters = ctx.coeff * ctx.v_max;
+
+                color_conv_function(num_iters, samples)?;
+            }
+
+            // After up-sampling the last row, save  any row that can be used for
+            // a later up-sampling,
+            //
+            // E.g the Y sample is not sampled but we haven't finished upsampling the last row of
+            // the previous mcu, since we don't have the down row, so save it
+            for component in comps.iter_mut() {
+                // Components the output colorspace does not use are not decoded, so
+                // they have no rows to carry over.
+                if !matches!(
+                    component.sample_ratio,
+                    SampleRatios::H | SampleRatios::Generic(_, _)
+                ) && component.needed
+                {
+                    // H and Generic sampling preserve their already-upsampled rows in worker.
+
+                    // copy last row to be used for the  next color conversion
+                    let size = component.vertical_sample
+                        * component.width_stride
+                        * component.sample_ratio.sample();
+
+                    let last_bytes = component.raw_coeff.rchunks_exact_mut(size).next().unwrap();
+
+                    component
+                        .first_row_upsample_dest
+                        .copy_from_slice(last_bytes);
+                }
+            }
+        }
+
+        let mut samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+
+        for (samp, component) in samples.iter_mut().zip(comps.iter()) {
+            *samp = if component.sample_ratio == SampleRatios::None {
+                &component.raw_coeff
+            } else {
+                &component.upsample_dest
+            };
+        }
+
+        // we either do 7 or 8 MCU's depending on the state, this only applies to
+        // vertically sampled images
+        //
+        // for rows up until the last MCU, we do not upsample the last stride of the MCU
+        // which means that the number of iterations should take that into account is one less the
+        // up-sampled size
+        //
+        // For the last MCU, we upsample the last stride, meaning that if we hit the last MCU, we
+        // should sample full raw coeffs
+        let is_last_considered = is_vertically_sampled && (i != mcu_height.saturating_sub(1));
+
+        let num_iters = (8 - usize::from(is_last_considered)) * ctx.coeff * ctx.v_max;
+
+        color_conv_function(num_iters, samples)?;
+    } else {
+        let mut channels_ref: [&[i16]; MAX_COMPONENTS] = [&[]; MAX_COMPONENTS];
+
+        comps
+            .iter()
+            .enumerate()
+            .for_each(|(pos, x)| channels_ref[pos] = &x.raw_coeff);
+
+        if let SampleRatios::Generic(_, v) = ctx.sample_ratio {
+            color_conv_function(8 * v * ctx.coeff, channels_ref)?;
+        } else {
+            color_conv_function(8 * ctx.coeff, channels_ref)?;
+        }
+    }
+
+    *pixels_written = px;
+    Ok(())
 }
 
 const SOS_AFTER_COMPLETE_SCAN: &str = "SOS after a baseline scan that already had all components";
