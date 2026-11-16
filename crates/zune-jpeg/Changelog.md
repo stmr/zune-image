@@ -1,3 +1,5 @@
+## Unreleased
+- Opt-in multi-threaded progressive finish (`DecoderOptions::jpeg_set_threads`, `std` only); default is single threaded, output is bit-identical.
 ## Version 0.5.7
 - Move scalar idct to wrapping maths.
 - Simd upsampling (mhils)

@@ -168,7 +168,12 @@ pub struct DecoderOptions {
     hevc_max_mdat_size: usize,
     /// Number of threads used for decoding
     ///
-    num_threads:        u8
+    num_threads:        u8,
+    /// Number of worker threads the jpeg decoder may use (`std` only).
+    ///
+    /// - Default value: 1 (single threaded)
+    /// - Respected by: `jpeg`
+    jpeg_threads:       u8
 }
 
 /// Initializers
@@ -426,6 +431,21 @@ impl DecoderOptions {
 
 /// JPEG specific options
 impl DecoderOptions {
+    /// Get the number of worker threads the jpeg decoder may use
+    pub const fn jpeg_get_threads(&self) -> u8 {
+        self.jpeg_threads
+    }
+
+    /// Set the number of worker threads the jpeg decoder may use.
+    ///
+    /// `1` (the default) decodes on the calling thread only. Values above one need the
+    /// `std` feature of `zune-jpeg` and parallelise stages of progressive decoding; the
+    /// output is bit-identical for every value.
+    pub fn jpeg_set_threads(mut self, threads: u8) -> Self {
+        self.jpeg_threads = threads.max(1);
+        self
+    }
+
     /// Get maximum scans for which the jpeg decoder
     /// should not go above for progressive images
     pub const fn jpeg_get_max_scans(&self) -> usize {
@@ -726,6 +746,7 @@ impl Default for DecoderOptions {
             // 16 mb
             hevc_max_mdat_size: 1 << 24,
             num_threads:        4,
+            jpeg_threads:       1,
             endianness:         ByteEndian::BE
         }
     }
