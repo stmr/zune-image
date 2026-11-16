@@ -1167,9 +1167,15 @@ impl BitStream for BitStreamHuffman {
         }
         if self.eob_run > 0 {
             // only run if block does not consists of purely zeroes
-            // changing this to iter_any makes perf regress by 10%
-            //   time:   [+10.836% +11.589% +12.376%] (p = 0.00 < 0.05)
-            if &block[1..] != &[0; 63] {
+            //
+            // `!= &[0; 63]` is a call to memcmp for 126 bytes, and `iter().any()` stops early
+            // so it cannot be vectorized. OR-ing everything together is branch-free and compiles
+            // to a few vector instructions.
+            if block[1..]
+                .iter()
+                .fold(0, |acc, &coefficient| acc | coefficient)
+                != 0
+            {
                 self.refill(reader)?;
 
                 while k <= self.spec_end {
