@@ -86,7 +86,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         #[cfg(feature = "std")]
         let result = if self.options.num_threads() > 1 {
             std::thread::scope(|scope| {
-                self.decode_mcu_ycbcr_baseline_inner::<B>(
+                self.decode_mcu_ycbcr_baseline_inner::<B, true>(
                     output,
                     &mut progressive_mcus,
                     &mut upsampler_scratch,
@@ -95,7 +95,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 )
             })
         } else {
-            self.decode_mcu_ycbcr_baseline_inner::<B>(
+            self.decode_mcu_ycbcr_baseline_inner::<B, false>(
                 output,
                 &mut progressive_mcus,
                 &mut upsampler_scratch,
@@ -104,7 +104,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             )
         };
         #[cfg(not(feature = "std"))]
-        let result = self.decode_mcu_ycbcr_baseline_inner::<B>(
+        let result = self.decode_mcu_ycbcr_baseline_inner::<B, false>(
             output,
             &mut progressive_mcus,
             &mut upsampler_scratch,
@@ -134,7 +134,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         clippy::used_underscore_binding
     )]
     #[inline(never)]
-    fn decode_mcu_ycbcr_baseline_inner<'s, 'a: 's, B: BitStream>(
+    fn decode_mcu_ycbcr_baseline_inner<'s, 'a: 's, B: BitStream, const PIPE: bool>(
         &mut self, output: &mut McuDecodeOutput<'a, '_>,
         progressive_mcus: &mut [Vec<i16>; MAX_COMPONENTS], upsampler_scratch_space: &mut Vec<i16>,
         pipe_scope: Option<&'s PipeScope<'s, '_>>, worker_error: &mut Option<DecodeErrors>
@@ -316,7 +316,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         // smaller images, luma output which leaves the workers almost nothing to do, ...) is
         // unchanged.
         let mut pipe: Option<Pipeline<'s, '_>> = None;
-        if let Some(scope) = pipe_scope {
+        if let Some(scope) = pipe_scope.filter(|_| PIPE) {
             let out_stride = width * self.options.jpeg_get_out_colorspace().num_components();
             let threads =
                 worker_threads(&self.options, width, usize::from(self.info.height), mcu_height);
@@ -404,7 +404,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         return Err(DecodeErrors::ExhaustedData);
                     }
                     if all_components_in_first_scan {
-                        fill_neutral(output, &mut pipe, pixels_written);
+                        fill_neutral::<PIPE>(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     break 'sos;
@@ -506,9 +506,11 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                                     if !stream.consumed_past_end() {
                                         let output_stride = width
                                             * self.options.jpeg_get_out_colorspace().num_components();
-                                        if let Some(pipe) = pipe.as_mut() {
-                                            pixels_written +=
-                                                pipe.submit(&self.components, i, mcu_height)?;
+                                        if PIPE && pipe.is_some() {
+                                            if let Some(pipe) = pipe.as_mut() {
+                                                pixels_written +=
+                                                    pipe.submit(&self.components, i, mcu_height)?;
+                                            }
                                         } else {
                                             self.post_process(
                                                 pixels,
@@ -523,8 +525,10 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                                         }
                                     }
                                     self.pixels_decoded = pixels_written;
-                                    if let Some(pipe) = pipe.as_mut() {
-                                        pipe.fill_neutral();
+                                    if PIPE && pipe.is_some() {
+                                        if let Some(pipe) = pipe.as_mut() {
+                                            pipe.fill_neutral();
+                                        }
                                     } else if let Some(remaining) = pixels.get_mut(pixels_written..) {
                                         remaining.fill(128);
                                     }
@@ -568,7 +572,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         return Err(DecodeErrors::ExhaustedData);
                     }
                     if all_components_in_first_scan {
-                        fill_neutral(output, &mut pipe, pixels_written);
+                        fill_neutral::<PIPE>(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     break 'sos;
@@ -631,9 +635,11 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         McuDecodeOutput::Pixels(pixels) => {
                             let output_stride =
                                 width * self.options.jpeg_get_out_colorspace().num_components();
-                            if let Some(pipe) = pipe.as_mut() {
-                                pixels_written +=
-                                    pipe.submit(&self.components, i, effective_mcu_height)?;
+                            if PIPE && pipe.is_some() {
+                                if let Some(pipe) = pipe.as_mut() {
+                                    pixels_written +=
+                                        pipe.submit(&self.components, i, effective_mcu_height)?;
+                                }
                             } else {
                                 self.post_process(
                                     pixels,
@@ -768,7 +774,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     }
                     McuContinuation::Terminate(_) => {
                         warn!("Got terminate signal, will not process further");
-                        fill_neutral(output, &mut pipe, pixels_written);
+                        fill_neutral::<PIPE>(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     McuContinuation::DnlFound(height) => {
@@ -1100,6 +1106,10 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         result
     }
 
+    // The plain and pipelined baseline loops both call this. With two callers LLVM stops
+    // inlining it (and `inner_decode_mcu_width`) into the loop as it does with one caller,
+    // which cost the threads == 1 path ~1%; force the single-caller code generation.
+    #[inline(always)]
     fn decode_mcu_width<const PROGRESSIVE: bool, B: BitStream>(
         &mut self, context: &mut McuWidthContext<'_, B>
     ) -> Result<McuContinuation, DecodeErrors> {
@@ -1127,6 +1137,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     // when `not SAMPLED` then the inner loop has exactly one iteration per component in
     // the scan. The difference was ~1% or a bit more.
     #[allow(clippy::too_many_lines)]
+    // In practice it is inlined into the baseline loop, as on a single caller; see above.
+    #[inline(always)]
     fn inner_decode_mcu_width<const PROGRESSIVE: bool, const SAMPLED: bool, B: BitStream>(
         &mut self, context: &mut McuWidthContext<'_, B>
     ) -> Result<McuContinuation, DecodeErrors> {
@@ -2143,11 +2155,13 @@ pub(crate) fn post_process_rows(
 }
 
 /// Fill the output not written so far with the neutral value (128).
-fn fill_neutral(
+fn fill_neutral<const PIPE: bool>(
     output: &mut McuDecodeOutput<'_, '_>, pipe: &mut Option<Pipeline<'_, '_>>, written: usize
 ) {
-    if let Some(pipe) = pipe {
-        pipe.fill_neutral();
+    if PIPE && pipe.is_some() {
+        if let Some(pipe) = pipe {
+            pipe.fill_neutral();
+        }
     } else if let Some(remaining) = output.pixels_mut().and_then(|p| p.get_mut(written..)) {
         remaining.fill(128);
     }
