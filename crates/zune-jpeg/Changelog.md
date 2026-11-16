@@ -1,3 +1,5 @@
+## Unreleased
+- Multi-threaded progressive finish (dequantize, IDCT, upsample, colour convert) following `DecoderOptions::num_threads` (default 4, `std` only); each thread gets at least 512K output pixels, so images under 1 MP stay single threaded. Output is bit-identical for every thread count; `set_num_threads(1)` keeps the previous single-threaded behaviour.
 ## Version 0.5.7
 - Move scalar idct to wrapping maths.
 - Simd upsampling (mhils)

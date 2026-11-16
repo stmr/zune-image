@@ -423,6 +423,25 @@ fn color_convert_ycbcr(
         rem.copy_from_slice(&temp[0..rem.len()]);
     }
 }
+
+/// Whether the row buffer of a vertically sampled component has a size `upsample` can
+/// work with. It depends only on the component's geometry, so callers that split the
+/// image into bands can check it up front: `upsample` otherwise reports the problem only
+/// once it reaches the component.
+pub(crate) fn upsample_dimensions_valid(component: &Components) -> bool {
+    if !component.needed || !matches!(component.sample_ratio, SampleRatios::V | SampleRatios::HV) {
+        return true;
+    }
+    let Some(stop_offset) = component
+        .raw_coeff
+        .len()
+        .checked_div(component.width_stride)
+    else {
+        return false;
+    };
+    component.raw_coeff.len() == stop_offset * component.width_stride * component.vertical_sample
+}
+
 pub(crate) fn upsample(
     component: &mut Components, mcu_height: usize, i: usize, upsampler_scratch_space: &mut [i16],
     has_vertical_sample: bool
