@@ -39,6 +39,78 @@ fn progressive_threads_match_single_thread() {
     }
 }
 
+fn decode_result(data: &[u8], cs: ColorSpace, threads: u8) -> Result<Vec<u8>, String> {
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(cs)
+        .set_num_threads(threads);
+    JpegDecoder::new_with_options(ZCursor::new(data), options)
+        .decode()
+        .map_err(|e| format!("{e:?}"))
+}
+
+const BASELINE: [&str; 5] = [
+    "speed_bench.jpg",
+    "speed_bench_horizontal_subsampling.jpg",
+    "speed_bench_vertical_subsampling.jpg",
+    "speed_bench_hv_subsampling.jpg",
+    "../2029.jpg"
+];
+
+#[test]
+fn baseline_threads_match_single_thread() {
+    let base = "../../test-images/jpeg/benchmarks/";
+    for name in BASELINE {
+        let data = std::fs::read(format!("{base}{name}")).unwrap();
+        for cs in [
+            ColorSpace::RGB,
+            ColorSpace::Luma,
+            ColorSpace::RGBA,
+            ColorSpace::BGR
+        ] {
+            let reference = decode(&data, cs, 1);
+            for threads in [2, 3, 8] {
+                assert!(
+                    reference == decode(&data, cs, threads),
+                    "{name} {cs:?} differs with {threads} threads"
+                );
+            }
+        }
+    }
+}
+
+/// Truncated and corrupted baseline streams give the same result (output or error) on every
+/// thread count.
+#[test]
+fn baseline_damaged_threads_match_single_thread() {
+    let base = "../../test-images/jpeg/benchmarks/";
+    for name in &BASELINE[..4] {
+        let data = std::fs::read(format!("{base}{name}")).unwrap();
+        let mut cases = Vec::new();
+        for k in 1..8 {
+            cases.push(data[..data.len() * k / 8].to_vec());
+        }
+        for k in 1..8_usize {
+            let mut damaged = data.clone();
+            for j in 0..4 {
+                let at = (data.len() * k / 8 + j * 7919) % data.len();
+                if at > 700 {
+                    damaged[at] ^= 0x5a + j as u8;
+                }
+            }
+            cases.push(damaged);
+        }
+        for (n, case) in cases.iter().enumerate() {
+            let reference = decode_result(case, ColorSpace::RGB, 1);
+            for threads in [2, 4, 8] {
+                assert!(
+                    reference == decode_result(case, ColorSpace::RGB, threads),
+                    "{name} case {n} differs with {threads} threads"
+                );
+            }
+        }
+    }
+}
+
 /// Found by fuzzing (minimized): a progressive image the single-threaded finish rejects at its
 /// first MCU row ("Invalid component dimensions") must be rejected the same way with threads,
 /// not panic in a band that starts mid-image. The size is raised to 1024x1040 so the image is

@@ -20,9 +20,10 @@ use crate::components::SampleRatios;
 use crate::decoder::{HeaderAppendStateSnapshot, McuDecodeOutput, MAX_COMPONENTS};
 use crate::errors::DecodeErrors;
 use crate::marker::Marker;
-use crate::mcu_prog::get_marker;
+use crate::mcu_prog::{get_marker, worker_threads};
 use crate::misc::{calculate_padded_width, setup_component_params};
-use crate::worker::{color_convert, upsample};
+use crate::pipeline::{PipeScope, Pipeline};
+use crate::worker::{color_convert, upsample, upsample_dimensions_valid};
 use crate::JpegDecoder;
 
 /// The size of a DC block for a MCU.
@@ -79,14 +80,43 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         // allocation-free.
         let mut progressive_mcus = core::mem::take(&mut self.progressive_mcus_buffer);
         let mut upsampler_scratch = core::mem::take(&mut self.upsampler_scratch);
+        // First error of the pipelined post-processing workers, if any: it precedes whatever
+        // the decoding thread returns, as in the sequential order of events.
+        let mut worker_error = None;
+        #[cfg(feature = "std")]
+        let result = if self.options.num_threads() > 1 {
+            std::thread::scope(|scope| {
+                self.decode_mcu_ycbcr_baseline_inner::<B>(
+                    output,
+                    &mut progressive_mcus,
+                    &mut upsampler_scratch,
+                    Some(scope),
+                    &mut worker_error
+                )
+            })
+        } else {
+            self.decode_mcu_ycbcr_baseline_inner::<B>(
+                output,
+                &mut progressive_mcus,
+                &mut upsampler_scratch,
+                None,
+                &mut worker_error
+            )
+        };
+        #[cfg(not(feature = "std"))]
         let result = self.decode_mcu_ycbcr_baseline_inner::<B>(
             output,
             &mut progressive_mcus,
             &mut upsampler_scratch,
+            None,
+            &mut worker_error,
         );
         self.progressive_mcus_buffer = progressive_mcus;
         self.upsampler_scratch = upsampler_scratch;
-        result
+        match worker_error {
+            Some(e) => Err(e),
+            None => result
+        }
     }
 
     /// Inner implementation of [`Self::decode_mcu_ycbcr_baseline`].
@@ -104,9 +134,10 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         clippy::used_underscore_binding
     )]
     #[inline(never)]
-    fn decode_mcu_ycbcr_baseline_inner<B: BitStream>(
-        &mut self, output: &mut McuDecodeOutput<'_, '_>,
+    fn decode_mcu_ycbcr_baseline_inner<'s, 'a: 's, B: BitStream>(
+        &mut self, output: &mut McuDecodeOutput<'a, '_>,
         progressive_mcus: &mut [Vec<i16>; MAX_COMPONENTS], upsampler_scratch_space: &mut Vec<i16>,
+        pipe_scope: Option<&'s PipeScope<'s, '_>>, worker_error: &mut Option<DecodeErrors>
     ) -> Result<(), DecodeErrors> {
         setup_component_params(self)?;
 
@@ -279,6 +310,47 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         // was not parsed, so there is no EOI to look for after it.
         let mut stopped_at_extra_sos = false;
         let mut last_scan_rows_decoded: usize;
+        // Pipeline (`num_threads() > 1`, image of at least 1 MP): this thread keeps entropy
+        // decoding + IDCT, scoped workers up-sample and colour convert. Only the plain one-shot
+        // single-scan pixel path is pipelined; everything else (incremental, checkpoints, DNL,
+        // smaller images, luma output which leaves the workers almost nothing to do, ...) is
+        // unchanged.
+        let mut pipe: Option<Pipeline<'s, '_>> = None;
+        if let Some(scope) = pipe_scope {
+            let out_stride = width * self.options.jpeg_get_out_colorspace().num_components();
+            let threads =
+                worker_threads(&self.options, width, usize::from(self.info.height), mcu_height);
+            if all_components_in_first_scan
+                && !resuming
+                && !self.mcu_checkpoints_enabled
+                && !self.expects_dnl
+                && self.pending_dnl_height.is_none()
+                && threads > 1
+                && self.options.jpeg_get_out_colorspace() != ColorSpace::Luma
+                && out_stride > 0
+                // workers start bands mid-image; an image the sequential path rejects at its
+                // first row must fail there, not in a band
+                && self.components.iter().all(upsample_dimensions_valid)
+            {
+                if let McuDecodeOutput::Pixels(pixels) = output {
+                    pipe = Pipeline::new(
+                        scope,
+                        threads,
+                        &self.components,
+                        self.post_ctx(),
+                        out_stride,
+                        width,
+                        padded_width,
+                        upsampler_scratch_space.len(),
+                        mcu_height,
+                        worker_error
+                    );
+                    if let Some(pipe) = pipe.as_mut() {
+                        pipe.attach(core::mem::take(pixels));
+                    }
+                }
+            }
+        }
         'sos: loop {
             last_scan_rows_decoded = 0;
             if resuming_current_scan {
@@ -332,11 +404,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         return Err(DecodeErrors::ExhaustedData);
                     }
                     if all_components_in_first_scan {
-                        if let Some(remaining) =
-                            output.pixels_mut().and_then(|pixels| pixels.get_mut(pixels_written..))
-                        {
-                            remaining.fill(128);
-                        }
+                        fill_neutral(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     break 'sos;
@@ -438,19 +506,26 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                                     if !stream.consumed_past_end() {
                                         let output_stride = width
                                             * self.options.jpeg_get_out_colorspace().num_components();
-                                        self.post_process(
-                                            pixels,
-                                            output_stride,
-                                            i,
-                                            mcu_height,
-                                            width,
-                                            padded_width,
-                                            &mut pixels_written,
-                                            upsampler_scratch_space,
-                                        )?;
+                                        if let Some(pipe) = pipe.as_mut() {
+                                            pixels_written +=
+                                                pipe.submit(&self.components, i, mcu_height)?;
+                                        } else {
+                                            self.post_process(
+                                                pixels,
+                                                output_stride,
+                                                i,
+                                                mcu_height,
+                                                width,
+                                                padded_width,
+                                                &mut pixels_written,
+                                                upsampler_scratch_space,
+                                            )?;
+                                        }
                                     }
                                     self.pixels_decoded = pixels_written;
-                                    if let Some(remaining) = pixels.get_mut(pixels_written..) {
+                                    if let Some(pipe) = pipe.as_mut() {
+                                        pipe.fill_neutral();
+                                    } else if let Some(remaining) = pixels.get_mut(pixels_written..) {
                                         remaining.fill(128);
                                     }
                                 }
@@ -493,11 +568,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         return Err(DecodeErrors::ExhaustedData);
                     }
                     if all_components_in_first_scan {
-                        if let Some(remaining) =
-                            output.pixels_mut().and_then(|pixels| pixels.get_mut(pixels_written..))
-                        {
-                            remaining.fill(128);
-                        }
+                        fill_neutral(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     break 'sos;
@@ -560,16 +631,21 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         McuDecodeOutput::Pixels(pixels) => {
                             let output_stride =
                                 width * self.options.jpeg_get_out_colorspace().num_components();
-                            self.post_process(
-                                pixels,
-                                output_stride,
-                                i,
-                                effective_mcu_height,
-                                width,
-                                padded_width,
-                                &mut pixels_written,
-                                upsampler_scratch_space,
-                            )?;
+                            if let Some(pipe) = pipe.as_mut() {
+                                pixels_written +=
+                                    pipe.submit(&self.components, i, effective_mcu_height)?;
+                            } else {
+                                self.post_process(
+                                    pixels,
+                                    output_stride,
+                                    i,
+                                    effective_mcu_height,
+                                    width,
+                                    padded_width,
+                                    &mut pixels_written,
+                                    upsampler_scratch_space,
+                                )?;
+                            }
                             // A row finished from zero padding past the end of the
                             // input is not stable: a retry with more input decodes it
                             // again with the real bits.
@@ -692,12 +768,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     }
                     McuContinuation::Terminate(_) => {
                         warn!("Got terminate signal, will not process further");
-                        if let Some(v) = output
-                            .pixels_mut()
-                            .and_then(|p| p.get_mut(pixels_written..))
-                        {
-                            v.fill(128);
-                        }
+                        fill_neutral(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     McuContinuation::DnlFound(height) => {
@@ -2069,6 +2140,17 @@ pub(crate) fn post_process_rows(
 
     *pixels_written = px;
     Ok(())
+}
+
+/// Fill the output not written so far with the neutral value (128).
+fn fill_neutral(
+    output: &mut McuDecodeOutput<'_, '_>, pipe: &mut Option<Pipeline<'_, '_>>, written: usize
+) {
+    if let Some(pipe) = pipe {
+        pipe.fill_neutral();
+    } else if let Some(remaining) = output.pixels_mut().and_then(|p| p.get_mut(written..)) {
+        remaining.fill(128);
+    }
 }
 
 const SOS_AFTER_COMPLETE_SCAN: &str = "SOS after a baseline scan that already had all components";

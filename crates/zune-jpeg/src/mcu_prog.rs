@@ -36,19 +36,16 @@ const SMOOTHING_COEFFICIENTS: [usize; 10] = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24];
 /// Fewest output pixels handed to one thread. Spawning threads per decode costs more than it
 /// saves below this: at a lower threshold (8 MCU rows per thread) a 256x256 progressive image
 /// decoded 46% slower with 4 threads on Windows and 20% slower on macOS.
-#[cfg(feature = "std")]
 pub(crate) const MIN_PIXELS_PER_THREAD: usize = 512 * 1024;
 
 /// Fewest MCU rows handed to one thread. Every band after the first re-runs the row before it
 /// to prime the up-sampler, so very wide but short images need a row cap as well.
-#[cfg(feature = "std")]
 pub(crate) const MIN_MCU_ROWS_PER_THREAD: usize = 4;
 
 /// Threads to post-process a `width` x `height` image of `mcu_rows` MCU rows with:
 /// `DecoderOptions::num_threads`, capped so every thread gets at least
 /// [`MIN_PIXELS_PER_THREAD`] pixels and [`MIN_MCU_ROWS_PER_THREAD`] MCU rows. Images under
 /// 1 MP stay on the calling thread.
-#[cfg(feature = "std")]
 pub(crate) fn worker_threads(
     options: &zune_core::options::DecoderOptions, width: usize, height: usize, mcu_rows: usize
 ) -> usize {
