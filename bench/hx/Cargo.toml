@@ -1,0 +1,10 @@
+[package]
+name = "hx"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+zune-jpeg = { path = "../crates/zune-jpeg" }
+zune-core = { path = "../crates/zune-core" }
+[workspace]
+[profile.release]
+debug = 1
