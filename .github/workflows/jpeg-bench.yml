@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -36,20 +36,22 @@ jobs:
           dev=origin/dev
           dev_aa=origin/dev
           c1=844f6dc7
-          c1a=origin/exp/c1a
-          c1b=origin/exp/c1b
-      - name: Experiment (c1 = ZCursor commit; c1a = only read_exact_bytes part; c1b = only read_byte part)
+          c4only=origin/exp/c4only
+          noc4=origin/exp/reg-noc4
+          reg=origin/perf/jpeg-regression-0.5
+          noc1=origin/exp/reg-noc1
+      - name: Experiment (c4only = dev + AC-refine commit; noc4 = regression branch without it)
         shell: bash
         env:
           ROUNDS: ${{ inputs.rounds }}
         run: |
           B=test-images/jpeg/benchmarks
-          python bench/ab.py bins exp.json "$ROUNDS" 3 1 dev,dev_aa,c1,c1a,c1b \
+          python bench/ab.py bins exp.json "$ROUNDS" 3 1 dev,dev_aa,c1,c4only,noc4,reg,noc1 \
             nosamp=$B/speed_bench.jpg:1:rgb \
-            gray=$B/speed_bench.jpg:1:luma \
-            rgba=$B/speed_bench.jpg:1:rgba \
             prog=$B/speed_bench_prog.jpg:1:rgb \
-            scalar_nosamp=$B/speed_bench.jpg:0:rgb
+            progh=$B/speed_bench_prog_h_sampling.jpg:1:rgb \
+            proghv=$B/speed_bench_prog_hv_sampling.jpg:1:rgb \
+            scalar_prog=$B/speed_bench_prog.jpg:0:rgb
           python bench/an.py exp.json dev --markdown --noise dev_aa >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v5
         if: always()
