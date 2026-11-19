@@ -1704,25 +1704,137 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub(crate) fn post_process(
         &mut self, pixels: &mut [u8], output_stride: usize, i: usize, mcu_height: usize,
         width: usize, padded_width: usize, pixels_written: &mut usize,
         upsampler_scratch_space: &mut [i16]
     ) -> Result<(), DecodeErrors> {
-        let ctx = self.post_ctx();
-        post_process_rows(
-            &ctx,
-            &mut self.components,
-            pixels,
-            output_stride,
-            i,
-            mcu_height,
-            width,
-            padded_width,
-            pixels_written,
-            upsampler_scratch_space
-        )
+        let out_colorspace_components = self.options.jpeg_get_out_colorspace().num_components();
+        let row_bytes = width
+            .checked_mul(out_colorspace_components)
+            .ok_or(DecodeErrors::FormatStatic("output row size overflow"))?;
+        if output_stride < row_bytes {
+            return Err(DecodeErrors::FormatStatic(
+                "output stride is smaller than the converted row width"
+            ));
+        }
+
+        let mut px = *pixels_written;
+        let is_vertically_sampled = self
+            .components
+            .iter()
+            .any(|c| c.sample_ratio == SampleRatios::HV || c.sample_ratio == SampleRatios::V);
+
+        let mut comp_len = self.components.len();
+        if out_colorspace_components < comp_len && self.options.jpeg_get_out_colorspace() == Luma {
+            comp_len = out_colorspace_components;
+        }
+        let mut color_conv_function =
+            |num_iters: usize, samples: [&[i16]; 4]| -> Result<(), DecodeErrors> {
+                for (pos, output) in pixels[px..]
+                    .chunks_exact_mut(output_stride)
+                    .take(num_iters)
+                    .enumerate()
+                {
+                    let mut raw_samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+                    for (j, samp) in raw_samples.iter_mut().enumerate().take(comp_len) {
+                        let temp = &samples[j].get(pos * padded_width..(pos + 1) * padded_width);
+                        if temp.is_none() {
+                            return Err(DecodeErrors::FormatStatic("Missing samples"));
+                        }
+                        *samp = temp.unwrap();
+                    }
+                    color_convert(
+                        &raw_samples,
+                        self.color_convert_16,
+                        self.input_colorspace,
+                        self.options.jpeg_get_out_colorspace(),
+                        &mut output[..row_bytes],
+                        width,
+                        padded_width
+                    )?;
+                    px += output_stride;
+                }
+                Ok(())
+            };
+
+        let comps = &mut self.components[..];
+
+        if self.is_interleaved && self.options.jpeg_get_out_colorspace() != ColorSpace::Luma {
+            for comp in comps.iter_mut() {
+                upsample(
+                    comp,
+                    mcu_height,
+                    i,
+                    upsampler_scratch_space,
+                    is_vertically_sampled
+                )?;
+            }
+
+            if is_vertically_sampled {
+                if i > 0 {
+                    let mut samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+
+                    for (samp, component) in samples.iter_mut().zip(comps.iter()) {
+                        *samp = &component.first_row_upsample_dest;
+                    }
+                    let _first_len = samples[0].len();
+                    let num_iters = self.coeff * self.v_max;
+
+                    color_conv_function(num_iters, samples)?;
+                }
+                for component in comps.iter_mut() {
+                    if !matches!(
+                        component.sample_ratio,
+                        SampleRatios::H | SampleRatios::Generic(_, _)
+                    ) && component.needed
+                    {
+                        let size = component.vertical_sample
+                            * component.width_stride
+                            * component.sample_ratio.sample();
+
+                        let last_bytes =
+                            component.raw_coeff.rchunks_exact_mut(size).next().unwrap();
+
+                        component
+                            .first_row_upsample_dest
+                            .copy_from_slice(last_bytes);
+                    }
+                }
+            }
+
+            let mut samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+
+            for (samp, component) in samples.iter_mut().zip(comps.iter()) {
+                *samp = if component.sample_ratio == SampleRatios::None {
+                    &component.raw_coeff
+                } else {
+                    &component.upsample_dest
+                };
+            }
+            let is_last_considered = is_vertically_sampled && (i != mcu_height.saturating_sub(1));
+
+            let num_iters = (8 - usize::from(is_last_considered)) * self.coeff * self.v_max;
+
+            color_conv_function(num_iters, samples)?;
+        } else {
+            let mut channels_ref: [&[i16]; MAX_COMPONENTS] = [&[]; MAX_COMPONENTS];
+
+            self.components
+                .iter()
+                .enumerate()
+                .for_each(|(pos, x)| channels_ref[pos] = &x.raw_coeff);
+
+            if let SampleRatios::Generic(_, v) = self.info.sample_ratio {
+                color_conv_function(8 * v * self.coeff, channels_ref)?;
+            } else {
+                color_conv_function(8 * self.coeff, channels_ref)?;
+            }
+        }
+
+        *pixels_written = px;
+        Ok(())
     }
 }
 

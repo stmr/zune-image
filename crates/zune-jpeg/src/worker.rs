@@ -507,7 +507,7 @@ pub(crate) fn upsample(
             let stride = component.width_stride * component.vertical_sample;
             let stop_offset = component.raw_coeff.len() / component.width_stride;
 
-            if !upsample_dimensions_valid(component) {
+            if component.raw_coeff.len() != stop_offset * stride {
                 // slice would panic below
                 return Err(DecodeErrors::FormatStatic(
                     "Invalid component dimensions, would panic"
