@@ -3,6 +3,9 @@ name: zune-jpeg upstream criterion suite
 # Runs upstream's own benchmarks/benches/decode_jpeg.rs for dev and each branch on
 # ubuntu-latest (upstream's benchmark platform) and compares them with critcmp.
 # dev runs first and last; dev vs dev2 shows the drift of the runner over the job.
+# Filter: zune-jpeg cases only (no mozjpeg); "DRI / Restart markers/incremental resume" and
+# the checkpoint retries are left out because the first panics on dev itself
+# (decode_jpeg.rs:334 "scan should not complete at 80% visibility").
 on:
   workflow_dispatch:
 
@@ -29,7 +32,8 @@ jobs:
                       pipe=origin/perf/jpeg-baseline-pipeline dev2=origin/dev; do
             name=${spec%%=*}; ref=${spec#*=}
             git worktree add --detach "_wt/$name" "$ref"
-            (cd "_wt/$name" && cargo bench -p zune-benches --bench decode_jpeg -- --save-baseline "$name" --noplot)
+            (cd "_wt/$name" && cargo bench -p zune-benches --bench decode_jpeg -- \
+              --save-baseline "$name" --noplot 'zune-jpeg|one-shot|raw iMCU|converted scanline')
             echo "built+ran $name = $ref @ $(git rev-parse --short "$ref")"
           done
       - name: Compare
