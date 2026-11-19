@@ -28,6 +28,9 @@ for spec in sys.argv[2:]:
     opts = (wt / "crates" / "zune-core" / "src" / "options" / "decoder.rs").read_text()
     (hx / "src" / "main.rs").write_text(src if "fn jpeg_set_threads" in opts else no_threads)
     env = dict(os.environ, CARGO_TARGET_DIR=str(root / "_target" / name))
+    if name.endswith("_aa"):
+        # A/A control: same source, different symbol hashes, so a different code layout.
+        env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -C metadata=aa").strip()
     subprocess.run(["cargo", "build", "--release", "--manifest-path", str(hx / "Cargo.toml")], env=env, check=True)
     shutil.copy2(root / "_target" / name / "release" / f"hx{exe}", out / f"hx_{name}{exe}")
     rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=wt, capture_output=True, text=True).stdout.strip()

@@ -45,13 +45,14 @@ jobs:
           thr=origin/perf/jpeg-threads
           scans=origin/perf/jpeg-prog-scans-parallel
           pipe=origin/perf/jpeg-baseline-pipeline
+          reg_aa=origin/perf/jpeg-regression-0.5
       - name: Single-thread gate
         shell: bash
         env:
           ROUNDS: ${{ inputs.rounds }}
         run: |
           B=test-images/jpeg/benchmarks
-          python bench/ab.py bins single.json "$ROUNDS" 3 1 dev,reg,thr:1,scans:1,pipe:1 \
+          python bench/ab.py bins single.json "$ROUNDS" 3 1 dev,reg,reg_aa,thr:1,scans:1,pipe:1 \
             nosamp=$B/speed_bench.jpg:1:rgb \
             hsamp=$B/speed_bench_horizontal_subsampling.jpg:1:rgb \
             vsamp=$B/speed_bench_vertical_subsampling.jpg:1:rgb \
@@ -69,7 +70,10 @@ jobs:
             python bench/an.py single.json dev --markdown
             echo
             echo "## ${{ matrix.os }}: threads=1 vs regression branch"
-            python bench/an.py single.json reg --markdown --exclude dev
+            python bench/an.py single.json reg --markdown --exclude dev --exclude reg_aa
+            echo
+            echo "## ${{ matrix.os }}: A/A control (same source as reg, different code layout)"
+            python bench/an.py single.json reg --markdown --exclude dev --exclude thr:1 --exclude scans:1 --exclude pipe:1
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Multi-thread comparison
         shell: bash
@@ -93,8 +97,8 @@ jobs:
       - name: Enforce single-thread gate (no regression vs dev, threads=1 vs regression branch)
         shell: bash
         run: |
-          python bench/an.py single.json dev --gate > /dev/null
-          python bench/an.py single.json reg --exclude dev --gate > /dev/null
+          python bench/an.py single.json dev --exclude reg_aa --gate > /dev/null
+          python bench/an.py single.json reg --exclude dev --exclude reg_aa --gate > /dev/null
         # The multi-thread comparison above stays report-only.
       - uses: actions/upload-artifact@v5
         if: always()
