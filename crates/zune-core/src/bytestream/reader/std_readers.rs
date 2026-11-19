@@ -9,12 +9,28 @@ use crate::bytestream::{ZByteReaderTrait, ZCursor};
 impl<T: io::BufRead + io::Seek> ZByteReaderTrait for T {
     #[inline(always)]
     fn read_byte_no_error(&mut self) -> u8 {
-        let mut buf = [0];
-        let _ = self.read(&mut buf);
-        buf[0]
+        // Serve the byte straight from the buffer when there is one: for in-memory readers
+        // like `ZCursor` this is a bounds check and a load, instead of a `Read::read` call.
+        match self.fill_buf() {
+            Ok(&[byte, ..]) => {
+                self.consume(1);
+                byte
+            }
+            _ => 0
+        }
     }
     #[inline(always)]
     fn read_exact_bytes(&mut self, buf: &mut [u8]) -> Result<(), ZByteIoError> {
+        // Fast path, as in `std::io::BufRead`-based `read_exact`: if the buffered data holds the
+        // whole read, copy it out with a length the compiler knows for small fixed reads
+        // instead of looping over `Read::read`.
+        if let Ok(available) = self.fill_buf() {
+            if let Some(src) = available.get(..buf.len()) {
+                buf.copy_from_slice(src);
+                self.consume(buf.len());
+                return Ok(());
+            }
+        }
         let mut bytes_read = 0;
 
         while bytes_read < buf.len() {
