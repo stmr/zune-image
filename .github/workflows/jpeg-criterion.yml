@@ -1,0 +1,49 @@
+name: zune-jpeg upstream criterion suite
+
+# Runs upstream's own benchmarks/benches/decode_jpeg.rs for dev and each branch on
+# ubuntu-latest (upstream's benchmark platform) and compares them with critcmp.
+# dev runs first and last; dev vs dev2 shows the drift of the runner over the job.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  criterion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install critcmp
+        run: cargo install critcmp --locked
+      - name: Benchmarks
+        shell: bash
+        run: |
+          export CARGO_TARGET_DIR="$PWD/_ctarget"
+          for spec in dev=origin/dev reg=origin/perf/jpeg-regression-0.5 \
+                      thr=origin/perf/jpeg-threads scans=origin/perf/jpeg-prog-scans-parallel \
+                      pipe=origin/perf/jpeg-baseline-pipeline dev2=origin/dev; do
+            name=${spec%%=*}; ref=${spec#*=}
+            git worktree add --detach "_wt/$name" "$ref"
+            (cd "_wt/$name" && cargo bench -p zune-benches --bench decode_jpeg -- --save-baseline "$name" --noplot)
+            echo "built+ran $name = $ref @ $(git rev-parse --short "$ref")"
+          done
+      - name: Compare
+        shell: bash
+        run: |
+          export CARGO_TARGET_DIR="$PWD/_ctarget"
+          {
+            echo '## upstream decode_jpeg criterion suite, ubuntu-latest'
+            echo '```'
+            critcmp --target-dir "$CARGO_TARGET_DIR" dev reg thr scans pipe dev2
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: criterion
+          path: _ctarget/criterion
