@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -36,19 +36,23 @@ jobs:
           dev=origin/dev
           dev_aa=origin/dev
           c1=844f6dc7
-          c2=ed912272
-          c3=cfabf9fd
           reg=origin/perf/jpeg-regression-0.5
-      - name: Experiment (threads=1 vs regression branch; thrpp = thr with the original post_process)
+          noc1=origin/exp/reg-noc1
+      - name: Experiment (c1 = ZCursor commit alone; noc1 = regression branch without it)
         shell: bash
         env:
           ROUNDS: ${{ inputs.rounds }}
         run: |
           B=test-images/jpeg/benchmarks
-          python bench/ab.py bins exp.json "$ROUNDS" 3 1 dev,dev_aa,c1,c2,c3,reg \
+          python bench/ab.py bins exp.json "$ROUNDS" 3 1 dev,dev_aa,c1,reg,noc1 \
             nosamp=$B/speed_bench.jpg:1:rgb \
+            hsamp=$B/speed_bench_horizontal_subsampling.jpg:1:rgb \
+            gray=$B/speed_bench.jpg:1:luma \
+            rgba=$B/speed_bench.jpg:1:rgba \
+            prog=$B/speed_bench_prog.jpg:1:rgb \
             scalar_nosamp=$B/speed_bench.jpg:0:rgb \
             scalar_prog=$B/speed_bench_prog.jpg:0:rgb
+          python bench/an.py exp.json dev --markdown --noise dev_aa >> "$GITHUB_STEP_SUMMARY"
           python bench/an.py exp.json dev --markdown >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v5
         if: always()

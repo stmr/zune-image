@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Analyse ab.py output against a base variant.
 
-usage: an.py DATA.json BASE [--markdown] [--exclude NAME ...] [--gate]
+usage: an.py DATA.json BASE [--markdown] [--exclude NAME ...] [--noise NAME] [--gate]
 
 Without --gate the script only reports. With --gate it exits 1 when any reported
 variant's verdict is SLOWER or INCONCLUSIVE (the single-thread no-regression gate).
@@ -9,8 +9,9 @@ variant's verdict is SLOWER or INCONCLUSIVE (the single-thread no-regression gat
 Round statistic = median of a variant's decodes in that round (no minima).
 Reports p10/p50/p90 of all decodes, the median paired ratio (variant/base) over rounds,
 a bootstrap 95% CI of that median (5000 resamples, fixed seed) and a two-sided sign test.
-Verdict (predeclared): FASTER if CI upper < 0; PASS if CI upper <= +0.5%;
-SLOWER if CI lower > 0; otherwise INCONCLUSIVE.
+Verdict: FASTER if CI upper < 0; PASS if CI upper <= bound; SLOWER if CI lower > 0;
+otherwise INCONCLUSIVE. bound = +0.5%, or with --noise NAME (an A/A build of BASE) the
+CI upper of NAME vs BASE on the same case of this run, if that is larger.
 """
 import json, math, random, statistics as st, sys
 
@@ -19,6 +20,7 @@ base = sys.argv[2]
 md = "--markdown" in sys.argv
 excluded = {sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--exclude"}
 gate = "--gate" in sys.argv
+noise = next((sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--noise"), None)
 failed = []
 random.seed(7)
 
@@ -35,28 +37,31 @@ def sign_p(k, n):
     return min(1.0, 2 * t)
 
 
+def compare(rr, b):
+    ratios = [st.median(r) / y for r, y in zip(rr, b)]
+    boot = sorted(st.median(random.choices(ratios, k=len(ratios))) for _ in range(5000))
+    k = sum(r < 1 for r in ratios)
+    return st.median(ratios), boot[125], boot[4874], k, sum(r != 1 for r in ratios)
+
+
 if md:
     print("| case | variant | p10 / p50 / p90 ms | vs " + base + " | 95% CI | faster | sign p | verdict |")
     print("|---|---|---|---|---|---|---|---|")
 for case, vs in data.items():
     b = [st.median(r) for r in vs[base]]
     allb = [x for r in vs[base] for x in r]
+    res = {v: compare(rr, b) for v, rr in vs.items() if v != base}
+    bound = max(1.005, res[noise][2]) if noise else 1.005
     if md:
-        print(f"| {case} | {base} | {pct(allb,10):.2f} / {pct(allb,50):.2f} / {pct(allb,90):.2f} | | | | | |")
+        print(f"| {case} | {base} | {pct(allb,10):.2f} / {pct(allb,50):.2f} / {pct(allb,90):.2f} | | bound +{100*(bound-1):.2f}% | | | |")
     else:
-        print(f"## {case}  ({base}: p10/p50/p90 {pct(allb,10):.2f} {pct(allb,50):.2f} {pct(allb,90):.2f} ms, rounds={len(b)})")
+        print(f"## {case}  ({base}: p10/p50/p90 {pct(allb,10):.2f} {pct(allb,50):.2f} {pct(allb,90):.2f} ms, rounds={len(b)}, bound +{100*(bound-1):.2f}%)")
     for v, rr in vs.items():
         if v == base or v in excluded:
             continue
-        a = [st.median(r) for r in rr]
         allv = [x for r in rr for x in r]
-        ratios = [x / y for x, y in zip(a, b)]
-        med = st.median(ratios)
-        boot = sorted(st.median(random.choices(ratios, k=len(ratios))) for _ in range(5000))
-        lo, hi = boot[125], boot[4874]
-        k = sum(r < 1 for r in ratios)
-        n = sum(r != 1 for r in ratios)
-        verdict = "FASTER" if hi < 1 else "PASS" if hi <= 1.005 else "SLOWER" if lo > 1 else "INCONCLUSIVE"
+        med, lo, hi, k, n = res[v]
+        verdict = "FASTER" if hi < 1 else "PASS" if hi <= bound else "SLOWER" if lo > 1 else "INCONCLUSIVE"
         dist = f"{pct(allv,10):.2f} / {pct(allv,50):.2f} / {pct(allv,90):.2f}"
         ci = f"[{100*(lo-1):+.2f}, {100*(hi-1):+.2f}]"
         if md:
