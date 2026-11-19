@@ -44,19 +44,14 @@ def compare(rr, b):
     return st.median(ratios), boot[125], boot[4874], k, sum(r != 1 for r in ratios)
 
 
-def bound_for(vs):
-    if not noise:
-        return 1.005
-    return max(1.005, compare(vs[noise], [st.median(r) for r in vs[base]])[2])
-
-
 if md:
     print("| case | variant | p10 / p50 / p90 ms | vs " + base + " | 95% CI | faster | sign p | verdict |")
     print("|---|---|---|---|---|---|---|---|")
 for case, vs in data.items():
     b = [st.median(r) for r in vs[base]]
     allb = [x for r in vs[base] for x in r]
-    bound = bound_for(vs)
+    res = {v: compare(rr, b) for v, rr in vs.items() if v != base}
+    bound = max(1.005, res[noise][2]) if noise else 1.005
     if md:
         print(f"| {case} | {base} | {pct(allb,10):.2f} / {pct(allb,50):.2f} / {pct(allb,90):.2f} | | bound +{100*(bound-1):.2f}% | | | |")
     else:
@@ -65,7 +60,7 @@ for case, vs in data.items():
         if v == base or v in excluded:
             continue
         allv = [x for r in rr for x in r]
-        med, lo, hi, k, n = compare(rr, b)
+        med, lo, hi, k, n = res[v]
         verdict = "FASTER" if hi < 1 else "PASS" if hi <= bound else "SLOWER" if lo > 1 else "INCONCLUSIVE"
         dist = f"{pct(allv,10):.2f} / {pct(allv,50):.2f} / {pct(allv,90):.2f}"
         ci = f"[{100*(lo-1):+.2f}, {100*(hi-1):+.2f}]"
