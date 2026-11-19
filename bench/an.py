@@ -11,7 +11,7 @@ Reports p10/p50/p90 of all decodes, the median paired ratio (variant/base) over 
 a bootstrap 95% CI of that median (5000 resamples, fixed seed) and a two-sided sign test.
 Verdict: FASTER if CI upper < 0; PASS if CI upper <= bound; SLOWER if CI lower > 0;
 otherwise INCONCLUSIVE. bound = +0.5%, or with --noise NAME (an A/A build of BASE) the
-largest CI upper of NAME vs BASE over all cases of this run, if that is larger.
+CI upper of NAME vs BASE on the same case of this run, if that is larger.
 """
 import json, math, random, statistics as st, sys
 
@@ -44,10 +44,11 @@ def compare(rr, b):
     return st.median(ratios), boot[125], boot[4874], k, sum(r != 1 for r in ratios)
 
 
-bound = 1.005
-if noise:
-    bound = max([bound] + [compare(vs[noise], [st.median(r) for r in vs[base]])[2] for vs in data.values()])
-    print(f"noise bound from {noise}: CI upper <= {100*(bound-1):+.2f}%" + ("\n" if md else ""))
+def bound_for(vs):
+    if not noise:
+        return 1.005
+    return max(1.005, compare(vs[noise], [st.median(r) for r in vs[base]])[2])
+
 
 if md:
     print("| case | variant | p10 / p50 / p90 ms | vs " + base + " | 95% CI | faster | sign p | verdict |")
@@ -55,10 +56,11 @@ if md:
 for case, vs in data.items():
     b = [st.median(r) for r in vs[base]]
     allb = [x for r in vs[base] for x in r]
+    bound = bound_for(vs)
     if md:
-        print(f"| {case} | {base} | {pct(allb,10):.2f} / {pct(allb,50):.2f} / {pct(allb,90):.2f} | | | | | |")
+        print(f"| {case} | {base} | {pct(allb,10):.2f} / {pct(allb,50):.2f} / {pct(allb,90):.2f} | | bound +{100*(bound-1):.2f}% | | | |")
     else:
-        print(f"## {case}  ({base}: p10/p50/p90 {pct(allb,10):.2f} {pct(allb,50):.2f} {pct(allb,90):.2f} ms, rounds={len(b)})")
+        print(f"## {case}  ({base}: p10/p50/p90 {pct(allb,10):.2f} {pct(allb,50):.2f} {pct(allb,90):.2f} ms, rounds={len(b)}, bound +{100*(bound-1):.2f}%)")
     for v, rr in vs.items():
         if v == base or v in excluded:
             continue
