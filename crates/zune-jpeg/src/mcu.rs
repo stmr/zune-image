@@ -20,9 +20,10 @@ use crate::components::SampleRatios;
 use crate::decoder::{HeaderAppendStateSnapshot, McuDecodeOutput, MAX_COMPONENTS};
 use crate::errors::DecodeErrors;
 use crate::marker::Marker;
-use crate::mcu_prog::get_marker;
+use crate::mcu_prog::{get_marker, worker_threads};
 use crate::misc::{calculate_padded_width, setup_component_params};
-use crate::worker::{color_convert, upsample};
+use crate::pipeline::{PipeScope, Pipeline};
+use crate::worker::{color_convert, upsample, upsample_dimensions_valid};
 use crate::JpegDecoder;
 
 /// The size of a DC block for a MCU.
@@ -79,14 +80,43 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         // allocation-free.
         let mut progressive_mcus = core::mem::take(&mut self.progressive_mcus_buffer);
         let mut upsampler_scratch = core::mem::take(&mut self.upsampler_scratch);
-        let result = self.decode_mcu_ycbcr_baseline_inner::<B>(
+        // First error of the pipelined post-processing workers, if any: it precedes whatever
+        // the decoding thread returns, as in the sequential order of events.
+        let mut worker_error = None;
+        #[cfg(feature = "std")]
+        let result = if self.options.num_threads() > 1 {
+            std::thread::scope(|scope| {
+                self.decode_mcu_ycbcr_baseline_inner::<B, true>(
+                    output,
+                    &mut progressive_mcus,
+                    &mut upsampler_scratch,
+                    Some(scope),
+                    &mut worker_error
+                )
+            })
+        } else {
+            self.decode_mcu_ycbcr_baseline_inner::<B, false>(
+                output,
+                &mut progressive_mcus,
+                &mut upsampler_scratch,
+                None,
+                &mut worker_error
+            )
+        };
+        #[cfg(not(feature = "std"))]
+        let result = self.decode_mcu_ycbcr_baseline_inner::<B, false>(
             output,
             &mut progressive_mcus,
             &mut upsampler_scratch,
+            None,
+            &mut worker_error,
         );
         self.progressive_mcus_buffer = progressive_mcus;
         self.upsampler_scratch = upsampler_scratch;
-        result
+        match worker_error {
+            Some(e) => Err(e),
+            None => result
+        }
     }
 
     /// Inner implementation of [`Self::decode_mcu_ycbcr_baseline`].
@@ -104,9 +134,10 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         clippy::used_underscore_binding
     )]
     #[inline(never)]
-    fn decode_mcu_ycbcr_baseline_inner<B: BitStream>(
-        &mut self, output: &mut McuDecodeOutput<'_, '_>,
+    fn decode_mcu_ycbcr_baseline_inner<'s, 'a: 's, B: BitStream, const PIPE: bool>(
+        &mut self, output: &mut McuDecodeOutput<'a, '_>,
         progressive_mcus: &mut [Vec<i16>; MAX_COMPONENTS], upsampler_scratch_space: &mut Vec<i16>,
+        pipe_scope: Option<&'s PipeScope<'s, '_>>, worker_error: &mut Option<DecodeErrors>
     ) -> Result<(), DecodeErrors> {
         setup_component_params(self)?;
 
@@ -279,6 +310,47 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         // was not parsed, so there is no EOI to look for after it.
         let mut stopped_at_extra_sos = false;
         let mut last_scan_rows_decoded: usize;
+        // Pipeline (`num_threads() > 1`, image of at least 1 MP): this thread keeps entropy
+        // decoding + IDCT, scoped workers up-sample and colour convert. Only the plain one-shot
+        // single-scan pixel path is pipelined; everything else (incremental, checkpoints, DNL,
+        // smaller images, luma output which leaves the workers almost nothing to do, ...) is
+        // unchanged.
+        let mut pipe: Option<Pipeline<'s, '_>> = None;
+        if let Some(scope) = pipe_scope.filter(|_| PIPE) {
+            let out_stride = width * self.options.jpeg_get_out_colorspace().num_components();
+            let threads =
+                worker_threads(&self.options, width, usize::from(self.info.height), mcu_height);
+            if all_components_in_first_scan
+                && !resuming
+                && !self.mcu_checkpoints_enabled
+                && !self.expects_dnl
+                && self.pending_dnl_height.is_none()
+                && threads > 1
+                && self.options.jpeg_get_out_colorspace() != ColorSpace::Luma
+                && out_stride > 0
+                // workers start bands mid-image; an image the sequential path rejects at its
+                // first row must fail there, not in a band
+                && self.components.iter().all(upsample_dimensions_valid)
+            {
+                if let McuDecodeOutput::Pixels(pixels) = output {
+                    pipe = Pipeline::new(
+                        scope,
+                        threads,
+                        &self.components,
+                        self.post_ctx(),
+                        out_stride,
+                        width,
+                        padded_width,
+                        upsampler_scratch_space.len(),
+                        mcu_height,
+                        worker_error
+                    );
+                    if let Some(pipe) = pipe.as_mut() {
+                        pipe.attach(core::mem::take(pixels));
+                    }
+                }
+            }
+        }
         'sos: loop {
             last_scan_rows_decoded = 0;
             if resuming_current_scan {
@@ -332,11 +404,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         return Err(DecodeErrors::ExhaustedData);
                     }
                     if all_components_in_first_scan {
-                        if let Some(remaining) =
-                            output.pixels_mut().and_then(|pixels| pixels.get_mut(pixels_written..))
-                        {
-                            remaining.fill(128);
-                        }
+                        fill_neutral::<PIPE>(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     break 'sos;
@@ -438,19 +506,30 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                                     if !stream.consumed_past_end() {
                                         let output_stride = width
                                             * self.options.jpeg_get_out_colorspace().num_components();
-                                        self.post_process(
-                                            pixels,
-                                            output_stride,
-                                            i,
-                                            mcu_height,
-                                            width,
-                                            padded_width,
-                                            &mut pixels_written,
-                                            upsampler_scratch_space,
-                                        )?;
+                                        if PIPE && pipe.is_some() {
+                                            if let Some(pipe) = pipe.as_mut() {
+                                                pixels_written +=
+                                                    pipe.submit(&self.components, i, mcu_height)?;
+                                            }
+                                        } else {
+                                            self.post_process(
+                                                pixels,
+                                                output_stride,
+                                                i,
+                                                mcu_height,
+                                                width,
+                                                padded_width,
+                                                &mut pixels_written,
+                                                upsampler_scratch_space,
+                                            )?;
+                                        }
                                     }
                                     self.pixels_decoded = pixels_written;
-                                    if let Some(remaining) = pixels.get_mut(pixels_written..) {
+                                    if PIPE && pipe.is_some() {
+                                        if let Some(pipe) = pipe.as_mut() {
+                                            pipe.fill_neutral();
+                                        }
+                                    } else if let Some(remaining) = pixels.get_mut(pixels_written..) {
                                         remaining.fill(128);
                                     }
                                 }
@@ -493,11 +572,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         return Err(DecodeErrors::ExhaustedData);
                     }
                     if all_components_in_first_scan {
-                        if let Some(remaining) =
-                            output.pixels_mut().and_then(|pixels| pixels.get_mut(pixels_written..))
-                        {
-                            remaining.fill(128);
-                        }
+                        fill_neutral::<PIPE>(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     break 'sos;
@@ -560,16 +635,23 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         McuDecodeOutput::Pixels(pixels) => {
                             let output_stride =
                                 width * self.options.jpeg_get_out_colorspace().num_components();
-                            self.post_process(
-                                pixels,
-                                output_stride,
-                                i,
-                                effective_mcu_height,
-                                width,
-                                padded_width,
-                                &mut pixels_written,
-                                upsampler_scratch_space,
-                            )?;
+                            if PIPE && pipe.is_some() {
+                                if let Some(pipe) = pipe.as_mut() {
+                                    pixels_written +=
+                                        pipe.submit(&self.components, i, effective_mcu_height)?;
+                                }
+                            } else {
+                                self.post_process(
+                                    pixels,
+                                    output_stride,
+                                    i,
+                                    effective_mcu_height,
+                                    width,
+                                    padded_width,
+                                    &mut pixels_written,
+                                    upsampler_scratch_space,
+                                )?;
+                            }
                             // A row finished from zero padding past the end of the
                             // input is not stable: a retry with more input decodes it
                             // again with the real bits.
@@ -692,12 +774,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     }
                     McuContinuation::Terminate(_) => {
                         warn!("Got terminate signal, will not process further");
-                        if let Some(v) = output
-                            .pixels_mut()
-                            .and_then(|p| p.get_mut(pixels_written..))
-                        {
-                            v.fill(128);
-                        }
+                        fill_neutral::<PIPE>(output, &mut pipe, pixels_written);
                         return Ok(());
                     }
                     McuContinuation::DnlFound(height) => {
@@ -1029,6 +1106,10 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         result
     }
 
+    // The plain and pipelined baseline loops both call this. With two callers LLVM stops
+    // inlining it (and `inner_decode_mcu_width`) into the loop as it does with one caller,
+    // which cost the threads == 1 path ~1%; force the single-caller code generation.
+    #[inline(always)]
     fn decode_mcu_width<const PROGRESSIVE: bool, B: BitStream>(
         &mut self, context: &mut McuWidthContext<'_, B>
     ) -> Result<McuContinuation, DecodeErrors> {
@@ -1056,6 +1137,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     // when `not SAMPLED` then the inner loop has exactly one iteration per component in
     // the scan. The difference was ~1% or a bit more.
     #[allow(clippy::too_many_lines)]
+    // In practice it is inlined into the baseline loop, as on a single caller; see above.
+    #[inline(always)]
     fn inner_decode_mcu_width<const PROGRESSIVE: bool, const SAMPLED: bool, B: BitStream>(
         &mut self, context: &mut McuWidthContext<'_, B>
     ) -> Result<McuContinuation, DecodeErrors> {
@@ -1867,6 +1950,220 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         *pixels_written = px;
         Ok(())
+    }
+
+    pub(crate) fn post_ctx(&self) -> PostCtx {
+        PostCtx {
+            out_colorspace:   self.options.jpeg_get_out_colorspace(),
+            input_colorspace: self.input_colorspace,
+            color_convert_16: self.color_convert_16,
+            is_interleaved:   self.is_interleaved,
+            coeff:            self.coeff,
+            v_max:            self.v_max,
+            sample_ratio:     self.info.sample_ratio
+        }
+    }
+}
+
+/// The decoder state post-processing reads besides the components, so that bands of MCU
+/// rows can be post-processed on other threads with their own copy of the components.
+#[derive(Clone, Copy)]
+pub(crate) struct PostCtx {
+    pub out_colorspace:   ColorSpace,
+    pub input_colorspace: ColorSpace,
+    pub color_convert_16: crate::decoder::ColorConvert16Ptr,
+    pub is_interleaved:   bool,
+    pub coeff:            usize,
+    pub v_max:            usize,
+    pub sample_ratio:     SampleRatios
+}
+
+/// [`JpegDecoder::post_process`] for a band of MCU rows on a worker thread, reading the
+/// decoder state from `ctx`. Keep the two in sync: the sequential path keeps its own copy
+/// because routing it through this function measured ~1-2% slower on x86_64 Windows.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn post_process_rows(
+    ctx: &PostCtx, comps: &mut [crate::components::Components], pixels: &mut [u8],
+    output_stride: usize, i: usize, mcu_height: usize, width: usize, padded_width: usize,
+    pixels_written: &mut usize, upsampler_scratch_space: &mut [i16]
+) -> Result<(), DecodeErrors> {
+    let out_colorspace_components = ctx.out_colorspace.num_components();
+    let row_bytes = width
+        .checked_mul(out_colorspace_components)
+        .ok_or(DecodeErrors::FormatStatic("output row size overflow"))?;
+    if output_stride < row_bytes {
+        return Err(DecodeErrors::FormatStatic(
+            "output stride is smaller than the converted row width"
+        ));
+    }
+
+    let mut px = *pixels_written;
+    // indicates whether image is vertically up-sampled
+    let is_vertically_sampled = comps
+        .iter()
+        .any(|c| c.sample_ratio == SampleRatios::HV || c.sample_ratio == SampleRatios::V);
+
+    let mut comp_len = comps.len();
+
+    // If we are moving from YCbCr -> Luma, we do not allocate storage for other components, so we
+    // will panic when we are trying to read samples, so for that case,
+    // hardcode it so that we  don't panic when doing
+    //   *samp = &samples[j][pos * padded_width..(pos + 1) * padded_width]
+    if out_colorspace_components < comp_len && ctx.out_colorspace == Luma {
+        comp_len = out_colorspace_components;
+    }
+    let mut color_conv_function =
+        |num_iters: usize, samples: [&[i16]; 4]| -> Result<(), DecodeErrors> {
+            for (pos, output) in pixels[px..]
+                .chunks_exact_mut(output_stride)
+                .take(num_iters)
+                .enumerate()
+            {
+                let mut raw_samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+
+                // iterate over each line, since color-convert needs only
+                // one line
+                for (j, samp) in raw_samples.iter_mut().enumerate().take(comp_len) {
+                    let temp = &samples[j].get(pos * padded_width..(pos + 1) * padded_width);
+                    if temp.is_none() {
+                        return Err(DecodeErrors::FormatStatic("Missing samples"));
+                    }
+                    *samp = temp.unwrap();
+                }
+                color_convert(
+                    &raw_samples,
+                    ctx.color_convert_16,
+                    ctx.input_colorspace,
+                    ctx.out_colorspace,
+                    &mut output[..row_bytes],
+                    width,
+                    padded_width
+                )?;
+                px += output_stride;
+            }
+            Ok(())
+        };
+
+    if ctx.is_interleaved && ctx.out_colorspace != ColorSpace::Luma {
+        for comp in comps.iter_mut() {
+            upsample(
+                comp,
+                mcu_height,
+                i,
+                upsampler_scratch_space,
+                is_vertically_sampled
+            )?;
+        }
+
+        if is_vertically_sampled {
+            if i > 0 {
+                // write the last line, it wasn't  up-sampled as we didn't have row_down
+                // yet
+                let mut samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+
+                for (samp, component) in samples.iter_mut().zip(comps.iter()) {
+                    *samp = &component.first_row_upsample_dest;
+                }
+
+                // ensure length matches for all samples
+                let _first_len = samples[0].len();
+
+                // This was a good check, but can be caused to panic, esp on invalid/corrupt images.
+                // See one in issue https://github.com/etemesi254/zune-image/issues/262, so for now
+                // we just ignore and generate invalid images at the end.
+
+                //
+                //
+                // for samp in samples.iter().take(comp_len) {
+                //     assert_eq!(first_len, samp.len());
+                // }
+                let num_iters = ctx.coeff * ctx.v_max;
+
+                color_conv_function(num_iters, samples)?;
+            }
+
+            // After up-sampling the last row, save  any row that can be used for
+            // a later up-sampling,
+            //
+            // E.g the Y sample is not sampled but we haven't finished upsampling the last row of
+            // the previous mcu, since we don't have the down row, so save it
+            for component in comps.iter_mut() {
+                // Components the output colorspace does not use are not decoded, so
+                // they have no rows to carry over.
+                if !matches!(
+                    component.sample_ratio,
+                    SampleRatios::H | SampleRatios::Generic(_, _)
+                ) && component.needed
+                {
+                    // H and Generic sampling preserve their already-upsampled rows in worker.
+
+                    // copy last row to be used for the  next color conversion
+                    let size = component.vertical_sample
+                        * component.width_stride
+                        * component.sample_ratio.sample();
+
+                    let last_bytes = component.raw_coeff.rchunks_exact_mut(size).next().unwrap();
+
+                    component
+                        .first_row_upsample_dest
+                        .copy_from_slice(last_bytes);
+                }
+            }
+        }
+
+        let mut samples: [&[i16]; 4] = [&[], &[], &[], &[]];
+
+        for (samp, component) in samples.iter_mut().zip(comps.iter()) {
+            *samp = if component.sample_ratio == SampleRatios::None {
+                &component.raw_coeff
+            } else {
+                &component.upsample_dest
+            };
+        }
+
+        // we either do 7 or 8 MCU's depending on the state, this only applies to
+        // vertically sampled images
+        //
+        // for rows up until the last MCU, we do not upsample the last stride of the MCU
+        // which means that the number of iterations should take that into account is one less the
+        // up-sampled size
+        //
+        // For the last MCU, we upsample the last stride, meaning that if we hit the last MCU, we
+        // should sample full raw coeffs
+        let is_last_considered = is_vertically_sampled && (i != mcu_height.saturating_sub(1));
+
+        let num_iters = (8 - usize::from(is_last_considered)) * ctx.coeff * ctx.v_max;
+
+        color_conv_function(num_iters, samples)?;
+    } else {
+        let mut channels_ref: [&[i16]; MAX_COMPONENTS] = [&[]; MAX_COMPONENTS];
+
+        comps
+            .iter()
+            .enumerate()
+            .for_each(|(pos, x)| channels_ref[pos] = &x.raw_coeff);
+
+        if let SampleRatios::Generic(_, v) = ctx.sample_ratio {
+            color_conv_function(8 * v * ctx.coeff, channels_ref)?;
+        } else {
+            color_conv_function(8 * ctx.coeff, channels_ref)?;
+        }
+    }
+
+    *pixels_written = px;
+    Ok(())
+}
+
+/// Fill the output not written so far with the neutral value (128).
+fn fill_neutral<const PIPE: bool>(
+    output: &mut McuDecodeOutput<'_, '_>, pipe: &mut Option<Pipeline<'_, '_>>, written: usize
+) {
+    if PIPE && pipe.is_some() {
+        if let Some(pipe) = pipe {
+            pipe.fill_neutral();
+        }
+    } else if let Some(remaining) = output.pixels_mut().and_then(|p| p.get_mut(written..)) {
+        remaining.fill(128);
     }
 }
 
