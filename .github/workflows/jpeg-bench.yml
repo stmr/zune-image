@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
+        os: [macos-latest]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -35,25 +35,14 @@ jobs:
           python bench/build.py bins
           dev=origin/dev
           dev_aa=origin/dev
-          reg=origin/perf/jpeg-regression-0.5
           v2=origin/perf/jpeg-pr1-v2
-      - name: PR1 v2 gate (v2 vs dev, per-case A/A bound from dev_aa)
+      - name: PR1 v2 follow-up on macOS scalar cases (60 rounds)
         shell: bash
         env:
           ROUNDS: ${{ inputs.rounds }}
         run: |
           B=test-images/jpeg/benchmarks
-          python bench/ab.py bins exp.json "$ROUNDS" 3 1 dev,dev_aa,reg,v2 \
-            nosamp=$B/speed_bench.jpg:1:rgb \
-            hsamp=$B/speed_bench_horizontal_subsampling.jpg:1:rgb \
-            vsamp=$B/speed_bench_vertical_subsampling.jpg:1:rgb \
-            hvsamp=$B/speed_bench_hv_subsampling.jpg:1:rgb \
-            gray=$B/speed_bench.jpg:1:luma \
-            rgba=$B/speed_bench.jpg:1:rgba \
-            prog=$B/speed_bench_prog.jpg:1:rgb \
-            progh=$B/speed_bench_prog_h_sampling.jpg:1:rgb \
-            progv=$B/speed_bench_prog_v_sampling.jpg:1:rgb \
-            proghv=$B/speed_bench_prog_hv_sampling.jpg:1:rgb \
+          python bench/ab.py bins exp.json "$ROUNDS" 3 1 dev,dev_aa,v2 \
             scalar_nosamp=$B/speed_bench.jpg:0:rgb \
             scalar_prog=$B/speed_bench_prog.jpg:0:rgb
           python bench/an.py exp.json dev --markdown --noise dev_aa >> "$GITHUB_STEP_SUMMARY"
