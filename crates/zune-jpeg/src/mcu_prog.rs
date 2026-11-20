@@ -23,11 +23,40 @@ use crate::decoder::{JpegDecoder, McuDecodeOutput, ProgressiveFineCheckpoint, MA
 use crate::errors::DecodeErrors;
 use crate::headers::parse_sos;
 use crate::marker::Marker;
+#[cfg(feature = "std")]
+use crate::mcu::post_process_rows;
 use crate::mcu::DCT_BLOCK;
 use crate::misc::{calculate_padded_width, setup_component_params};
+#[cfg(feature = "std")]
+use crate::worker::upsample_dimensions_valid;
 
 const PROGRESSIVE_CHECKPOINT_ROW_INTERVAL: usize = 8;
 const SMOOTHING_COEFFICIENTS: [usize; 10] = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24];
+
+/// Fewest output pixels handed to one thread. Spawning threads per decode costs more than it
+/// saves below this: at a lower threshold (8 MCU rows per thread) a 256x256 progressive image
+/// decoded 46% slower with 4 threads on Windows and 20% slower on macOS.
+#[cfg(feature = "std")]
+pub(crate) const MIN_PIXELS_PER_THREAD: usize = 512 * 1024;
+
+/// Fewest MCU rows handed to one thread. Every band after the first re-runs the row before it
+/// to prime the up-sampler, so very wide but short images need a row cap as well.
+#[cfg(feature = "std")]
+pub(crate) const MIN_MCU_ROWS_PER_THREAD: usize = 4;
+
+/// Threads to post-process a `width` x `height` image of `mcu_rows` MCU rows with:
+/// `DecoderOptions::num_threads`, capped so every thread gets at least
+/// [`MIN_PIXELS_PER_THREAD`] pixels and [`MIN_MCU_ROWS_PER_THREAD`] MCU rows. Images under
+/// 1 MP stay on the calling thread.
+#[cfg(feature = "std")]
+pub(crate) fn worker_threads(
+    options: &zune_core::options::DecoderOptions, width: usize, height: usize, mcu_rows: usize
+) -> usize {
+    usize::from(options.num_threads())
+        .min(width.saturating_mul(height) / MIN_PIXELS_PER_THREAD)
+        .min(mcu_rows / MIN_MCU_ROWS_PER_THREAD)
+        .max(1)
+}
 
 fn progressive_input_available<B: BitStream>(stream: &B) -> bool {
     // Refill records EOF after reading the last real byte, then appends zero
@@ -1204,6 +1233,108 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         let handled_restart = self.handle_rst_main_inner(stream)?;
         Ok(was_due && handled_restart)
     }
+    /// Dequantize, IDCT, up-sample and colour convert the whole image on `threads` scoped
+    /// threads, each handling a contiguous band of MCU rows.
+    ///
+    /// Up-sampling carries the last rows of one MCU row into the next, so every band
+    /// except the first first runs the row before it into a scratch buffer to reach the
+    /// same carried state the sequential loop has. Output is bit-identical to
+    /// the sequential loop.
+    #[cfg(feature = "std")]
+    #[allow(clippy::too_many_arguments)]
+    fn finish_progressive_bands(
+        &self, block: &[Vec<i16>; MAX_COMPONENTS], pixels: &mut [u8], threads: usize,
+        mcu_height: usize, width: usize, padded_width: usize, scratch_len: usize
+    ) -> Result<(), DecodeErrors> {
+        let ctx = self.post_ctx();
+        let idct = self.idct_func;
+        let stride = width * ctx.out_colorspace.num_components();
+        let vertical = self
+            .components
+            .iter()
+            .any(|c| c.sample_ratio == SampleRatios::HV || c.sample_ratio == SampleRatios::V);
+        // pixel rows written when MCU row `i` is post-processed, see `post_process_rows`
+        let lines = |i: usize| -> usize {
+            if ctx.is_interleaved && ctx.out_colorspace != ColorSpace::Luma {
+                let cv = ctx.coeff * ctx.v_max;
+                if vertical {
+                    usize::from(i > 0) * cv
+                        + (8 - usize::from(i != mcu_height.saturating_sub(1))) * cv
+                } else {
+                    8 * cv
+                }
+            } else if let SampleRatios::Generic(_, v) = ctx.sample_ratio {
+                8 * v * ctx.coeff
+            } else {
+                8 * ctx.coeff
+            }
+        };
+        let bands = threads.min(mcu_height).max(1);
+        let rows_per_band = mcu_height.div_ceil(bands);
+
+        std::thread::scope(|scope| {
+            let mut rest = pixels;
+            let mut handles = Vec::with_capacity(bands);
+            for start in (0..mcu_height).step_by(rows_per_band) {
+                let end = (start + rows_per_band).min(mcu_height);
+                let band_len = (start..end).map(|i| lines(i) * stride).sum::<usize>();
+                let (band, tail) = rest.split_at_mut(band_len.min(rest.len()));
+                rest = tail;
+                let prime_len = if start > 0 { lines(start - 1) * stride } else { 0 };
+                let mut components = self.components.clone();
+                let mut cancel = self.cancel_debounced(self.mcu_x);
+                handles.push(scope.spawn(move || -> Result<(), DecodeErrors> {
+                    let mut tmp = [0_i32; DCT_BLOCK];
+                    let mut scratch = alloc::vec![0_i16; scratch_len];
+                    let mut sink = alloc::vec![0_u8; prime_len];
+                    let mut written = 0;
+                    for i in start.saturating_sub(1)..end {
+                        if cancel.is_cancelled() {
+                            return Err(DecodeErrors::Cancelled);
+                        }
+                        for (position, component) in components.iter_mut().enumerate() {
+                            if component.needed {
+                                idct_mcu_row(component, &block[position], i, idct, &mut tmp)?;
+                            }
+                        }
+                        if i < start {
+                            // priming row, output discarded
+                            post_process_rows(
+                                &ctx,
+                                &mut components,
+                                &mut sink,
+                                stride,
+                                i,
+                                mcu_height,
+                                width,
+                                padded_width,
+                                &mut 0,
+                                &mut scratch
+                            )?;
+                        } else {
+                            post_process_rows(
+                                &ctx,
+                                &mut components,
+                                band,
+                                stride,
+                                i,
+                                mcu_height,
+                                width,
+                                padded_width,
+                                &mut written,
+                                &mut scratch
+                            )?;
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            handles
+                .into_iter()
+                .try_for_each(|handle| handle.join().expect("jpeg band thread panicked"))
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::needless_range_loop, clippy::cast_sign_loss)]
     fn finish_progressive_decoding(
@@ -1320,6 +1451,33 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         } else {
             mcu_height
         };
+
+        // Bands start mid-image, so an image the sequential loop would reject at its first
+        // row must take that loop: it then fails the same way instead of in a band.
+        #[cfg(feature = "std")]
+        let threads =
+            worker_threads(&self.options, width, usize::from(self.info.height), mcu_height);
+        #[cfg(feature = "std")]
+        if threads > 1
+            && stripe_start == 0
+            && stripe_end == mcu_height
+            && self.components.iter().all(upsample_dimensions_valid)
+        {
+            if let McuDecodeOutput::Pixels(pixels) = output {
+                self.finish_progressive_bands(
+                    block,
+                    pixels,
+                    threads,
+                    mcu_height,
+                    width,
+                    padded_width,
+                    upsampler_scratch_space.len()
+                )?;
+                output.mark_source_complete();
+                self.progressive_render_incomplete = false;
+                return Ok(());
+            }
+        }
 
         // dequantize, idct and color convert.
         let mut cancel = self.cancel_debounced(self.mcu_x);
@@ -1491,6 +1649,44 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         self.components[0].width_stride = (self.info.width as usize).div_ceil(8) * 8;
         self.components[0].horizontal_sample = 1;
     }
+}
+
+/// Dequantize and inverse transform MCU row `i` of `plane` into `component.raw_coeff`.
+#[cfg(feature = "std")]
+fn idct_mcu_row(
+    component: &mut crate::components::Components, plane: &[i16], i: usize,
+    idct: crate::decoder::IDCTPtr, tmp: &mut [i32; DCT_BLOCK]
+) -> Result<(), DecodeErrors> {
+    let step = component.width_stride * component.vertical_sample * 8;
+    let slice = plane
+        .get(i * step..(i + 1) * step)
+        .ok_or(DecodeErrors::FormatStatic("Component buffer too small"))?;
+    let mut idct_pos = 0;
+    for k in 0..component.vertical_sample {
+        for j in 0..component.width_stride / 8 {
+            let start = j * 64 + k * 8 * component.width_stride;
+            let Some(qt_slice) = slice.get(start..start + 64) else {
+                return Err(DecodeErrors::FormatStatic(
+                    "Invalid slice , would panic, invalid image"
+                ));
+            };
+            for ((x, out), qt_val) in qt_slice
+                .iter()
+                .zip(tmp.iter_mut())
+                .zip(component.quantization_table.iter())
+            {
+                *out = i32::from(*x) * qt_val;
+            }
+            idct(
+                tmp,
+                &mut component.raw_coeff[idct_pos..],
+                component.width_stride
+            );
+            idct_pos += 8;
+        }
+        idct_pos += 7 * component.width_stride;
+    }
+    Ok(())
 }
 
 ///Get a marker from the bit-stream.
