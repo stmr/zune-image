@@ -326,6 +326,9 @@ fn decode_restart_resume(c: &mut Criterion) {
             let limit = Rc::new(Cell::new(partial));
             let cursor = GrowableCursor::new(data.as_slice(), Rc::clone(&limit));
             let mut decoder = JpegDecoder::new(cursor);
+            // Scan EOF is only recoverable in incremental mode; without it the
+            // first attempt returns best-effort output and nothing is resumed.
+            decoder.set_incremental_mode(true);
             decoder.decode_headers().expect("headers should fit in 80%");
             let mut out = vec![0u8; decoder.output_buffer_size().unwrap()];
 
@@ -362,11 +365,15 @@ fn decode_streaming_mode(c: &mut Criterion) {
 
     let partial = data.len() * 80 / 100;
 
-    group.bench_function("first retry default", |b| {
+    // Without incremental mode, only strict mode makes scan EOF recoverable
+    // (default mode returns best-effort output), and the retry replays the
+    // scan from its start: the baseline for the checkpointed retry below.
+    group.bench_function("first retry strict-mode", |b| {
         b.iter(|| {
             let limit = Rc::new(Cell::new(partial));
             let cursor = GrowableCursor::new(data.as_slice(), Rc::clone(&limit));
-            let mut decoder = JpegDecoder::new(cursor);
+            let options = DecoderOptions::default().set_strict_mode(true);
+            let mut decoder = JpegDecoder::new_with_options(cursor, options);
             decoder.decode_headers().expect("headers should fit in 80%");
             let mut out = vec![0u8; decoder.output_buffer_size().unwrap()];
 
