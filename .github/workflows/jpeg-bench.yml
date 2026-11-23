@@ -35,15 +35,14 @@ jobs:
           python bench/build.py bins
           dev=origin/dev
           dev_aa=origin/dev
-          reg=origin/perf/jpeg-regression-0.5
-          v2=origin/perf/jpeg-pr1-v2
-      - name: PR1 v2 gate (v2 vs dev, per-case A/A bound from dev_aa)
+          v2=origin/bench-pr1-merged
+      - name: PR1 refresh (dev 7fb8416 + PR1 merge vs dev, per-case A/A bound from dev_aa)
         shell: bash
         env:
           ROUNDS: ${{ inputs.rounds }}
         run: |
           B=test-images/jpeg/benchmarks
-          python bench/ab.py bins exp.json "$ROUNDS" 3 1 dev,dev_aa,reg,v2 \
+          python bench/ab.py bins exp.json "$ROUNDS" 3 1 dev,dev_aa,v2 \
             nosamp=$B/speed_bench.jpg:1:rgb \
             hsamp=$B/speed_bench_horizontal_subsampling.jpg:1:rgb \
             vsamp=$B/speed_bench_vertical_subsampling.jpg:1:rgb \
