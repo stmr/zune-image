@@ -27,14 +27,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install criterion dependencies
-        run: cargo install cargo-criterion
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-dev
+          cargo install cargo-criterion
 
       # ----------------------------
       # Run benchmarks (current ref)
       # ----------------------------
       - name: Run benchmarks
+        shell: bash
         run: |
-          cargo criterion --message-format=json | tee bench.json
+          cargo criterion -p zune-benches --message-format=json | tee bench.json
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -52,14 +56,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install criterion
-        run: cargo install cargo-criterion
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvips-dev
 
       # ----------------------------
       # Benchmark PR branch
       # ----------------------------
       - name: Run PR benchmarks
-        run: cargo criterion --message-format=json > pr.json
+        run: cargo bench -p zune-benches --bench '*' -- --save-baseline pr
 
       # ----------------------------
       # Run base branch benchmark in an isolated worktree
@@ -75,8 +81,9 @@ jobs:
 
           (
             cd "${base_worktree}"
-            cargo criterion --message-format=json
-          ) > dev.json
+            # Share the target directory so both baselines land in target/criterion.
+            CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target" cargo bench -p zune-benches --bench '*' -- --save-baseline dev
+          )
 
       # ----------------------------
       # Compare results
@@ -85,8 +92,9 @@ jobs:
         run: cargo install critcmp
 
       - name: Compare benchmarks
+        shell: bash
         run: |
-          critcmp dev.json pr.json | tee diff.txt
+          critcmp dev pr | tee diff.txt
 
       # ----------------------------
       # Comment PR
